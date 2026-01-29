@@ -1,0 +1,171 @@
+--- a/lm_eval/models/megatron_lm.py	2026-01-27 21:49:03.099017929 +0800
++++ b/lm_eval/models/megatron_lm.py	2026-01-21 13:31:32.277937871 +0800
+@@ -319,5 +319,128 @@
+ 
+         return re_ord.get_original(res)
+ 
+-    def generate_until(self, requests):
+-        assert False, "Not implemented"
+\ No newline at end of file
++    def generate_until(self, requests, disable_tqdm=False):
++        if not requests:
++            return []
++
++        res = []
++
++        def _collate(x):
++            toks = self.tok_encode(x[0])
++            return -len(toks), x[0]
++
++        re_ords = Collator(
++            [req.args for req in requests],
++            sort_fn=_collate,
++            group_by="gen_kwargs",
++        )
++
++        chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
++        pbar = tqdm(
++            total=len(requests),
++            disable=(disable_tqdm or (self.rank != 0)),
++            desc="Running generate_until requests",
++        )
++
++        for chunk in chunks:
++            contexts, all_gen_kwargs = zip(*chunk)
++            gen_kwargs = all_gen_kwargs[0]
++
++            # Extract generation parameters
++            until = gen_kwargs.get("until", [])
++            if isinstance(until, str):
++                until = [until]
++            until = deepcopy(until)
++            max_gen_toks = gen_kwargs.get("max_gen_toks", self.max_gen_toks)
++            temperature = gen_kwargs.get("temperature", 0.0)
++            do_sample = gen_kwargs.get("do_sample", False)
++
++            # Megatron uses top_k=1 for greedy decoding, not temperature
++            # When do_sample=False or temperature=0, use greedy decoding
++            if not do_sample or temperature == 0.0:
++                top_k = 1  # Greedy decoding
++                top_p = 0.0
++                temp = 1.0  # Temperature not used in greedy mode
++            else:
++                top_k = gen_kwargs.get("top_k", 0)
++                top_p = gen_kwargs.get("top_p", 0.0)
++                temp = temperature
++
++            # Debug: print generation parameters
++            # if self.rank == 0 and len(res) == 0:
++            #     print(f"\n[DEBUG GEN PARAMS]")
++            #     print(f"  max_gen_toks: {max_gen_toks}")
++            #     print(f"  temperature: {temperature}")
++            #     print(f"  do_sample: {do_sample}")
++            #     print(f"  until: {until}")
++            #     print(f"  top_k (original): {gen_kwargs.get('top_k', 0)}")
++            #     print(f"  top_p (original): {gen_kwargs.get('top_p', 0.0)}")
++            #     print(f"  [ADJUSTED] top_k: {top_k}, top_p: {top_p}, temp: {temp}")
++
++            # Truncate context to fit within max_length
++            max_ctx_len = self.max_length - max_gen_toks
++            truncated_contexts = []
++            context_lens = []
++            for ctx in contexts:
++                enc = self.tok_encode(ctx)
++                if len(enc) > max_ctx_len:
++                    enc = enc[-max_ctx_len:]
++                # Detokenize and re-tokenize to get actual token count
++                decoded_ctx = self.tok_decode(enc)
++                truncated_contexts.append(decoded_ctx)
++                # Re-tokenize to get the actual token count that will be used
++                actual_enc = self.tok_encode(decoded_ctx)
++                context_lens.append(len(actual_enc))
++
++            # Call generation - returns (prompts_plus_generations, segments, log_probs, tokens)
++            output = generate_and_post_process(
++                model=self.model,
++                prompts=truncated_contexts,
++                tokens_to_generate=max_gen_toks,
++                temperature=temp,
++                top_k_sampling=top_k,
++                top_p_sampling=top_p,
++                use_eod_token_for_early_termination=True,
++            )
++
++            # Extract continuations from output
++            if output is not None:
++                prompts_plus_generations = output[0]
++            else:
++                prompts_plus_generations = [""] * len(truncated_contexts)
++
++            for idx, (ctx, gen, (cache_key, _)) in enumerate(zip(truncated_contexts, prompts_plus_generations, chunk)):
++                # Use string slicing - more reliable than token-based slicing
++                # because gen = ctx + continuation (Megatron returns full prompt + generation)
++                if gen.startswith(ctx):
++                    continuation = gen[len(ctx):]
++                else:
++                    # Fallback: try to find ctx in gen and extract after it
++                    ctx_pos = gen.find(ctx)
++                    if ctx_pos >= 0:
++                        continuation = gen[ctx_pos + len(ctx):]
++                    else:
++                        # Last resort: return everything after removing common prefix
++                        continuation = gen
++
++                # Debug output for first sample
++                # if self.rank == 0 and len(res) == 0:
++                #     print(f"\n[DEBUG] String slicing method")
++                #     print(f"[DEBUG] Context length (chars): {len(ctx)}")
++                #     print(f"[DEBUG] Generation length (chars): {len(gen)}")
++                #     print(f"[DEBUG] gen.startswith(ctx): {gen.startswith(ctx)}")
++                #     print(f"[DEBUG] Context (first 100 chars): {ctx[:100]}")
++                #     print(f"[DEBUG] Full generation (first 200 chars): {gen[:200]}")
++                #     print(f"[DEBUG] Continuation (first 300 chars): {continuation[:300]}")
++
++                # Truncate at stop sequences
++                for term in until:
++                    if term in continuation:
++                        continuation = continuation.split(term)[0]
++
++                self.cache_hook.add_partial("generate_until", cache_key, continuation)
++                res.append(continuation)
++                pbar.update(1)
++
++        pbar.close()
++        return re_ords.get_original(res)
+--- a/lm_eval/tasks/bbh/fewshot/_fewshot_template_yaml	2026-01-27 21:49:03.147017934 +0800
++++ b/lm_eval/tasks/bbh/fewshot/_fewshot_template_yaml	2026-01-20 23:44:59.570697395 +0800
+@@ -6,15 +6,20 @@
+   - metric: exact_match
+     aggregation: mean
+     higher_is_better: true
+-    # ignore_case: true
+-    # ignore_punctuation: true
++    ignore_case: true
++    ignore_punctuation: false
++    regexes_to_ignore:
++      - "^\\s+"
++      - "\\s+$"
+ generation_kwargs:
+   until:
+     - "</s>"
+-    - "Q"
++    - "Q:"
+     - "\n\n"
++    - "\n"
+   do_sample: false
+   temperature: 0.0
++  max_gen_toks: 32
+ num_fewshot: 3
+ metadata:
+   version: 2.0
+--- a/lm_eval/tasks/gsm8k/gsm8k.yaml	2026-01-27 21:49:03.199017940 +0800
++++ b/lm_eval/tasks/gsm8k/gsm8k.yaml	2026-01-20 22:22:17.495206414 +0800
+@@ -20,6 +20,8 @@
+       - "\\$"
+       - "(?s).*#### "
+       - "\\.$"
++      - "^\\s+"
++      - "\\s+$"
+ generation_kwargs:
+   until:
+     - "Question:"

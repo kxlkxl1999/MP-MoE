@@ -1,0 +1,1983 @@
+--- a/megatron/core/models/gpt/moe_module_specs.py	2026-01-27 21:48:41.063016583 +0800
++++ b/megatron/core/models/gpt/moe_module_specs.py	2025-12-25 14:21:47.468750979 +0800
+@@ -2,11 +2,12 @@
+ 
+ import warnings
+ from typing import Optional
+-
++from megatron.core.transformer.module import MegatronModule
+ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+ from megatron.core.transformer.mlp import MLPSubmodules
+ from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+ from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
++from megatron.core.transformer.moe.moe_layer import MoPELayer  # ← 新增
+ from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+ from megatron.core.transformer.spec_utils import ModuleSpec
+ from megatron.core.utils import get_te_version, is_te_min_version
+@@ -24,6 +25,29 @@
+     HAVE_TE = False
+ 
+ 
++
++class MoEOrMoPE(MegatronModule):
++    """Pick MoELayer or MoPELayer at construction time."""
++    def __init__(self, config, submodules=None, layer_number=None):
++        # 关键：一定要把 config 传给父类 MegatronModule
++        super().__init__(config=config)
++
++        use_mope = getattr(config, "moe_router_load_balancing_type", "") == "otep"
++        cls = MoPELayer if use_mope else MoELayer
++        # 允许 layer_number 先为 None；Megatron 稍后会调用 set_layer_number
++        self.impl = cls(config=config, submodules=submodules, layer_number=layer_number)
++
++    def set_layer_number(self, layer_number: int):
++        self.layer_number = layer_number
++        print(f"[MoEOrMoPE] set_layer_number -> {layer_number}")
++        if hasattr(self.impl, "set_layer_number"):
++            self.impl.set_layer_number(layer_number)
++        else:
++            setattr(self.impl, "layer_number", layer_number)
++
++    def forward(self, *args, **kwargs):
++        return self.impl(*args, **kwargs)
++
+ def get_moe_module_spec(
+     use_te: Optional[bool] = True,
+     num_experts: Optional[int] = None,
+@@ -76,6 +100,7 @@
+ 
+     # MoE module spec
+     moe_module_spec = ModuleSpec(
+-        module=MoELayer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
++        module=MoEOrMoPE,
++        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
+     )
+     return moe_module_spec
+--- a/megatron/core/transformer/moe/moe_layer.py	2026-01-27 21:48:41.075016583 +0800
++++ b/megatron/core/transformer/moe/moe_layer.py	2025-12-25 14:09:04.608774376 +0800
+@@ -1,17 +1,23 @@
+ # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ 
++import os
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+-from typing import Union
+-
+-import os
++from datetime import datetime
+ from pathlib import Path
+-
++from types import FunctionType
++from typing import Optional, Union
++from megatron.core import parallel_state as mpu
++import numpy as np
+ import torch
+-
++import torch.distributed as dist
++import torch.nn as nn
+ from megatron.core import parallel_state, tensor_parallel
++from megatron.core.num_microbatches_calculator import get_num_microbatches
+ from megatron.core.transformer.module import MegatronModule
+-from megatron.core.transformer.moe.legacy_a2a_token_dispatcher import MoEAlltoAllSEQTokenDispatcher
++from megatron.core.transformer.moe.legacy_a2a_token_dispatcher import (
++    MoEAlltoAllSEQTokenDispatcher,
++)
+ from megatron.core.transformer.moe.router import TopKRouter
+ from megatron.core.transformer.moe.token_dispatcher import (
+     MoEAllGatherTokenDispatcher,
+@@ -21,46 +27,145 @@
+ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+ from megatron.core.transformer.transformer_config import TransformerConfig
+ 
++TokenDispatcherType = Union[
++    MoEAllGatherTokenDispatcher,
++    MoEAlltoAllTokenDispatcher,
++    MoEAlltoAllSEQTokenDispatcher,
++    MoEFlexTokenDispatcher,
++]
++
++ModuleLike = Union[nn.Module, FunctionType]
++
++
++def _resolve_figures_root() -> Path:
++    """Locate FLAME-MoE repo root so Figures live beside Megatron-LM."""
++    module_path = Path(__file__).resolve()
++    for ancestor in module_path.parents:
++        if ancestor.name == "Megatron-LM":
++            return ancestor.parent / "Figures"
++    # Fallback: stay relative to current module if Megatron-LM isn't found
++    return module_path.parent / "Figures"
++
++
++_FIGURES_ROOT = _resolve_figures_root()
++PLOT_DIR = _FIGURES_ROOT / datetime.now().strftime("plot_%Y%m%d_%H%M%S_MOE")
++PLOT_STATS_DIR = PLOT_DIR / "stats"
++PLOT_DIR.mkdir(parents=True, exist_ok=True)
++PLOT_STATS_DIR.mkdir(parents=True, exist_ok=True)
++
++
++def _is_log_rank_dp0() -> bool:
++    if not dist.is_available() or not dist.is_initialized():
++        return True  # 单进程/未初始化时允许输出
++
++    try:
++        # 只看数据并行维度，确保每个 DP 组只写一次
++        return mpu.get_data_parallel_rank() == 0
++    except Exception:
++        # 兜底：退化为全局 rank0
++        return dist.get_rank() == 0
++
++
++def _print_rank0(message: str):
++    if not dist.is_available() or not dist.is_initialized():
++        print(message, flush=True)
++        return
++    if dist.get_rank() == 0:
++        print(message, flush=True)
++
++
++def _dump_moe_stats_to_disk(
++    *,
++    layer_num: int,
++    segment_idx: int,
++    model_type: str,
++    expert_counts,
++    cooccurrence_matrix,
++    extra_payload: Optional[dict] = None,
++) -> str:
++    """Persist aggregated routing statistics for offline plotting."""
++
++    base_name = f"layer{layer_num}_seg{segment_idx}_{model_type}"
++    filename = PLOT_STATS_DIR / f"{base_name}.npz"
++
++    payload = {
++        "expert_counts": np.array(expert_counts, copy=True),
++        "cooccurrence_matrix": np.array(cooccurrence_matrix, copy=True),
++        "timestamp": np.array(datetime.now().isoformat()),
++    }
++    if extra_payload:
++        payload.update(extra_payload)
++
++    np.savez_compressed(str(filename), **payload)
++    return str(filename)
++
+ 
+ @dataclass
+ class MoESubmodules:
+     """MoE Layer Submodule spec"""
+ 
+-    experts: Union[ModuleSpec, type] = None
+-    shared_experts: Union[ModuleSpec, type] = None
++    experts: Optional[Union[ModuleSpec, type]] = None
++    shared_experts: Optional[Union[ModuleSpec, type]] = None
++
++
++@dataclass
++class _RoutingDumpState:
++    cnts: int
++    rank: int
++    dump_dir: Path
+ 
+ 
+ class BaseMoELayer(MegatronModule, ABC):
++    TRACKED_LAYERS = (2, 5, 9)
+     """Base class for a mixture of experts layer.
+ 
+     Args:
+         config (TransformerConfig): Configuration object for the transformer model.
+     """
+ 
+-    def __init__(self, config: TransformerConfig, layer_number: int = None):
++    def __init__(
++        self,
++        config: TransformerConfig,
++        submodules: Optional[MoESubmodules] = None,
++        layer_number: Optional[int] = None,
++    ):
+         super(BaseMoELayer, self).__init__(config)
+         self.config = config
+-        self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
+-        assert self.expert_parallel_size > 0, "Expected non-negative expert parallel size"
++        self.submodules: MoESubmodules = submodules or MoESubmodules()
++        self.expert_parallel_size = (
++            parallel_state.get_expert_model_parallel_world_size()
++        )
++        assert self.expert_parallel_size > 0, (
++            "Expected non-negative expert parallel size"
++        )
+ 
+-        assert self.config.num_moe_experts % self.expert_parallel_size == 0
+-        self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
++        num_moe_experts = self.config.num_moe_experts
++        if num_moe_experts is None:
++            raise RuntimeError("num_moe_experts must be set in config")
++        self.num_moe_experts: int = int(num_moe_experts)
++
++        assert self.num_moe_experts % self.expert_parallel_size == 0
++        self.num_local_experts: int = self.num_moe_experts // self.expert_parallel_size
+         local_expert_indices_offset = (
+             parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
+         )
+ 
+-        self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
++        self.use_shared_expert = (
++            self.config.moe_shared_expert_intermediate_size is not None
++        )
+         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
+ 
+         self.local_expert_indices = [
+             local_expert_indices_offset + i for i in range(self.num_local_experts)
+         ]
+-        assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
+-        self.router = None
+-        self.experts = None
+-        self.shared_experts = None
+-        self.token_dispatcher = None
++        assert all(map(lambda x: x < self.num_moe_experts, self.local_expert_indices))
++        self.moe_layer_recompute = config.moe_layer_recompute
++        self.router: Optional[TopKRouter] = None
++        self.experts: Optional[ModuleLike] = None
++        self.shared_experts: Optional[ModuleLike] = None
++        self.token_dispatcher: Optional[TokenDispatcherType] = None
+         self.layer_number = layer_number
++        self._dump_state: Optional[_RoutingDumpState] = None
+ 
+     @abstractmethod
+     def forward(self, hidden_states):
+@@ -70,7 +175,231 @@
+     def set_layer_number(self, layer_number: int):
+         """Set the layer number for the MoE layer."""
+         self.layer_number = layer_number
+-        self.router.set_layer_number(layer_number)
++        if self.router is not None:
++            self.router.set_layer_number(layer_number)
++
++    def _build_router(self):
++        """Initialize router."""
++        return TopKRouter(config=self.config)
++
++    def _build_token_dispatcher(self):
++        """Initialize token dispatcher."""
++        # 四种选择只影响数据通讯过程，不影响返回结果
++        # 默认 allgather 官方同时推荐在启用 Expert Parallelism（EP）时用 alltoall。
++        dispatcher_type = self.config.moe_token_dispatcher_type
++        args = (self.num_local_experts, self.local_expert_indices)
++        if dispatcher_type == "allgather":
++            return MoEAllGatherTokenDispatcher(*args, config=self.config)
++        if dispatcher_type == "alltoall":
++            return MoEAlltoAllTokenDispatcher(*args, config=self.config)
++        if dispatcher_type == "alltoall_seq":
++            return MoEAlltoAllSEQTokenDispatcher(*args, config=self.config)
++        if dispatcher_type == "flex":
++            return MoEFlexTokenDispatcher(*args, config=self.config)
++        raise ValueError(f"Unsupported token dispatcher type: {dispatcher_type}")
++
++    def _build_experts(self) -> ModuleLike:
++        """Initialize experts."""
++        if self.submodules is None or self.submodules.experts is None:
++            raise RuntimeError("MoE experts specification is missing.")
++        return build_module(
++            self.submodules.experts, self.num_local_experts, self.config
++        )
++
++    def _build_shared_experts(self) -> Optional[ModuleLike]:
++        """Initialize shared experts."""
++        if not self.use_shared_expert or self.submodules is None:
++            return None
++        if self.submodules.shared_experts is None:
++            return None
++        shared = build_module(self.submodules.shared_experts, config=self.config)
++        if self.shared_expert_overlap and self.token_dispatcher is not None:
++            self.token_dispatcher.set_shared_experts(shared)
++        return shared
++
++    def _ensure_dump_state(self) -> _RoutingDumpState:
++        """Ensure dump state is initialized."""
++        if self._dump_state is not None:
++            return self._dump_state
++        if not torch.distributed.is_initialized():
++            raise RuntimeError("Distributed backend must be initialized for dump.")
++        rank = torch.distributed.get_rank()
++        dump_dir = Path(os.environ["EACT_SAVE"], str(self.layer_number))
++        dump_dir.mkdir(parents=True, exist_ok=True)
++        self._dump_state = _RoutingDumpState(cnts=0, rank=rank, dump_dir=dump_dir)
++        return self._dump_state
++
++    def _track_stats_this_layer(self) -> bool:
++        """Check if stats should be tracked for this layer."""
++        return getattr(self, "layer_number", None) in self.TRACKED_LAYERS
++
++    def _init_moe_stats_buffers_if_needed(self):
++        """Initialize MoE stats buffers if needed.
++        Every tracked layer creates these buffers once."""
++        if not self._track_stats_this_layer() or hasattr(self, "expert_usage_counter"):
++            return
++        E_global = int(self.num_moe_experts)
++        self.expert_usage_counter = np.zeros(E_global, dtype=np.int64)
++        self.expert_cooccurrence_counter = np.zeros(
++            (E_global, E_global), dtype=np.int64
++        )
++        # Stats counting is tracked in optimizer-step units (not per-forward).
++        # We still observe routing per forward/microbatch and accumulate into the
++        # numpy buffers above, but we only advance the "step counter" once we've
++        # completed `get_num_microbatches()` training forwards.
++        self._stats_microbatches_in_step = 0
++        self._stats_step_count = 0
++        self._stats_segment_idx = 0
++
++    def _get_stats_window_size(self):
++        """Get the stats window size in optimizer steps.
++
++        `--moe-plot-every` is defined in *optimizer-step* units (global steps).
++        We convert training microbatch-forwards into step counts separately.
++        """
++        return max(1, int(getattr(self.config, "moe_plot_every", 200)))
++
++    def _should_count_stats_this_forward(self) -> bool:
++        """Decide whether to count stats in this forward pass.
++
++        Defaults is closed. Appending --moe-layer-recompute to open it to lower memory usage."""
++        return (not self.moe_layer_recompute) or (
++            self.moe_layer_recompute and (not torch.is_grad_enabled())
++        )
++
++    def _maybe_track_routing_stats(self, routing_map: torch.Tensor):
++        """Track routing statistics on the local rank and convert GPU tensors to CPU NumPy arrays."""
++        self._init_moe_stats_buffers_if_needed()
++        with torch.no_grad():
++            token_per_expert = routing_map.sum(dim=0)
++            route_float = routing_map.float()
++            co_mat = torch.matmul(route_float.t(), route_float)
++
++        # 不做统计直接返回（例如不在 tracked layers）
++        if not (
++            self._track_stats_this_layer() and hasattr(self, "expert_usage_counter")
++        ):
++            return token_per_expert, co_mat
++
++        # Only count *training* microbatches towards optimizer-step windows.
++        # This avoids:
++        # - eval/inference forwards skewing the expected frequency,
++        # - --moe-layer-recompute causing double-counting (the recompute forward runs again).
++        should_advance_counters = (
++            self.training and self._should_count_stats_this_forward()
++        )
++
++        if not should_advance_counters:
++            return token_per_expert, co_mat
++
++        # 🔥注意：统计逻辑必须在 return 前执行
++        self.expert_usage_counter += token_per_expert.cpu().numpy().astype(np.int64)
++        self.expert_cooccurrence_counter += co_mat.cpu().numpy().astype(np.int64)
++
++        self._stats_microbatches_in_step += 1
++        try:
++            num_mbs = int(get_num_microbatches())
++        except Exception:
++            num_mbs = 1
++        if self._stats_microbatches_in_step >= max(1, num_mbs):
++            self._stats_microbatches_in_step = 0
++            self._stats_step_count += 1
++
++        return token_per_expert, co_mat
++
++    def _reduce_moe_stats_for_plot(self, device):
++        """Collect all rank stats, and return summed numpy arrays
++
++        无条件进入 collective; 返回 (u_sum_np, C_sum_np)，不直接覆盖 self.*"""
++        E_global = int(self.num_moe_experts)
++        if not hasattr(self, "expert_usage_counter"):
++            u_local = torch.zeros(E_global, dtype=torch.int32, device=device)
++            C_local = torch.zeros(E_global, E_global, dtype=torch.int32, device=device)
++        else:
++            u_local = torch.as_tensor(
++                self.expert_usage_counter, device=device, dtype=torch.int32
++            )
++            C_local = torch.as_tensor(
++                self.expert_cooccurrence_counter, device=device, dtype=torch.int32
++            )
++        u_sum = u_local.clone()
++        C_sum = C_local.clone()
++        if mpu.get_expert_model_parallel_world_size() > 1:  # EP
++            ep_group = mpu.get_expert_model_parallel_group()
++            torch.distributed.all_reduce(
++                u_sum, op=torch.distributed.ReduceOp.SUM, group=ep_group
++            )
++            torch.distributed.all_reduce(
++                C_sum, op=torch.distributed.ReduceOp.SUM, group=ep_group
++            )
++        if mpu.get_tensor_model_parallel_world_size() > 1:  # TP
++            tp_group = mpu.get_tensor_model_parallel_group()
++            torch.distributed.all_reduce(
++                u_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group
++            )
++            torch.distributed.all_reduce(
++                C_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group
++            )
++        return u_sum.int().cpu().numpy(), C_sum.int().cpu().numpy()
++
++    def _handle_moe_stats_plotting(
++        self,
++        model_type: str,
++        device: torch.device,
++        extra_message: str = "",
++        extra_rank0_dump_fn=None,
++    ):
++        """Save stats for plotting.
++
++        Args:
++            model_type: str, "moe" or "mope"
++            device: torch.device, device to perform all_reduce
++            extra_message: str, extra message to print on rank 0
++            extra_rank0_dump_fn: Optional function returning extra payload dict for dump
++        """
++        if not (
++            self._track_stats_this_layer() and hasattr(self, "expert_usage_counter")
++        ):
++            return
++        if not self.training:
++            return
++        do_plot = self._stats_step_count >= self._get_stats_window_size()
++        if not do_plot:
++            return
++        u_sum_np, C_sum_np = self._reduce_moe_stats_for_plot(device=device)
++        if _is_log_rank_dp0():
++            window = self._get_stats_window_size()
++            tag = model_type.upper()
++            message = (
++                f"[{tag}] trigger plot at layer {self.layer_number}: "
++                f"steps={self._stats_step_count}, window={window}"
++            )
++            if extra_message:
++                message = f"{message}, {extra_message}"
++            _print_rank0(
++                message
++            )  # _is_log_rank_dp0 has guarantee that only rank 0 in DP group will print
++
++            self._stats_segment_idx += 1
++            extra_payload = None
++            if extra_rank0_dump_fn is not None:
++                extra_payload = extra_rank0_dump_fn(self._stats_segment_idx)
++            if self.layer_number is None:
++                raise RuntimeError("MoE layer_number must be set to dump stats")
++            stats_path = _dump_moe_stats_to_disk(
++                layer_num=int(self.layer_number),
++                segment_idx=self._stats_segment_idx,
++                model_type=model_type,
++                expert_counts=u_sum_np,
++                cooccurrence_matrix=C_sum_np,
++                extra_payload=extra_payload,
++            )
++            _print_rank0(f"[{tag}] saved stats to {stats_path}")
++        if hasattr(self, "expert_usage_counter"):
++            self.expert_usage_counter.fill(0)
++            self.expert_cooccurrence_counter.fill(0)
++        self._stats_microbatches_in_step = 0
++        self._stats_step_count = 0
+ 
+ 
+ class MoELayer(BaseMoELayer):
+@@ -81,45 +410,19 @@
+     """
+ 
+     def __init__(
+-        self, config: TransformerConfig, submodules: MoESubmodules = None, layer_number: int = None
++        self,
++        config: TransformerConfig,
++        submodules: Optional[MoESubmodules] = None,
++        layer_number: Optional[int] = None,
+     ):
+-        self.submodules = submodules
+-        super(MoELayer, self).__init__(config=config, layer_number=layer_number)
+-        self.moe_layer_recompute = config.moe_layer_recompute
+-
+-        # Initialize router
+-        self.router = TopKRouter(config=self.config)
+-
+-        # Initialize token dispatcher
+-        if config.moe_token_dispatcher_type == "allgather":
+-            self.token_dispatcher = MoEAllGatherTokenDispatcher(
+-                self.num_local_experts, self.local_expert_indices, config=self.config
+-            )
+-        elif config.moe_token_dispatcher_type == "alltoall":
+-            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+-                self.num_local_experts, self.local_expert_indices, config=self.config
+-            )
+-        elif config.moe_token_dispatcher_type == "alltoall_seq":
+-            self.token_dispatcher = MoEAlltoAllSEQTokenDispatcher(
+-                self.num_local_experts, self.local_expert_indices, config=self.config
+-            )
+-        elif config.moe_token_dispatcher_type == "flex":
+-            self.token_dispatcher = MoEFlexTokenDispatcher(
+-                self.num_local_experts, self.local_expert_indices, config=self.config
+-            )
+-        else:
+-            raise ValueError(
+-                f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
+-            )
+-
+-        # Initialize experts
+-        self.experts = build_module(self.submodules.experts, self.num_local_experts, self.config)
+-
+-        # Initialize shared experts
+-        if self.use_shared_expert:
+-            self.shared_experts = build_module(self.submodules.shared_experts, config=self.config)
+-            if self.shared_expert_overlap:
+-                self.token_dispatcher.set_shared_experts(self.shared_experts)
++        super(MoELayer, self).__init__(
++            config=config, submodules=submodules, layer_number=layer_number
++        )
++        self._init_moe_stats_buffers_if_needed()
++        self.router = self._build_router()
++        self.experts = self._build_experts()
++        self.token_dispatcher = self._build_token_dispatcher()
++        self.shared_experts = self._build_shared_experts()
+ 
+     def forward(self, hidden_states: torch.Tensor):
+         if (
+@@ -132,33 +435,319 @@
+                 "are enabled without also enabling sequence parallelism."
+             )
+ 
++        # 输入 hidden_states: shape = [num_tokens, hidden_size] 或 [batch_size * seq_len, hidden_size]；
++        # 返回 output: 与输入 shape 相同，是专家处理后的 token 表示
+         # process MoE
+         def custom_forward(hidden_states):
++            if (
++                self.router is None
++                or self.token_dispatcher is None
++                or self.experts is None
++            ):
++                raise RuntimeError("MoE layer modules are not initialized.")
++
++            # routing
++            # probs: shape = [num_tokens, num_experts] 每个专家的概率
++            # routing_map: shape = [num_tokens, num_experts] 每个 token 被分配给的专家的0-1矩阵
+             probs, routing_map = self.router(hidden_states)
++            self._maybe_track_routing_stats(routing_map)
+ 
+             # capture the activated expert ids
+             if not self.training and self.config.test_mode:
+-                if not hasattr(self, "cnts") or not hasattr(self, "rank"):
+-                    self.cnts, self.rank = 0, torch.distributed.get_rank()
+-                    self.dump = Path(os.environ["EACT_SAVE"], str(self.layer_number))
+-                    self.dump.mkdir(parents=True, exist_ok=True)
++                dump_state = self._ensure_dump_state()
+                 values, indices = torch.topk(probs, k=self.config.moe_router_topk)
+-                torch.save((values, indices), Path(self.dump, f"{self.cnts}-{self.rank}.pt"))
+-                self.cnts += 1
+-
+-            (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
+-                hidden_states, probs, routing_map
++                torch.save(
++                    (values, indices),
++                    dump_state.dump_dir / f"{dump_state.cnts}-{dump_state.rank}.pt",
++                )
++                dump_state.cnts += 1
++
++            # dispatch tokens to experts
++            # dispatched_input: shape = [num_experts, capacity, hidden_size]；
++            # tokens_per_expert: 长度为 num_experts 的列表，表示每个专家获得的 token 数量。
++            (dispatched_input, tokens_per_expert) = (
++                self.token_dispatcher.token_permutation(
++                    hidden_states, probs, routing_map
++                )
+             )
++
++            # experts forward
++            # expert_output: shape = [num_experts, capacity, hidden_size]
++            # mlp_bias: 专家输出中的 bias（用于残差/融合）
+             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
+-            output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
++
++            # token unpermutation
++            # output 恢复为 [num_tokens, hidden_size] 或 [batch_size * seq_len, hidden_size]
++            output, mlp_bias = self.token_dispatcher.token_unpermutation(
++                expert_output, mlp_bias
++            )
++
++            # shared expert forward
+             if self.use_shared_expert and not self.shared_expert_overlap:
++                if self.shared_experts is None:
++                    raise RuntimeError("Shared expert module is not initialized.")
+                 # if shared_expert_overlap is True, the expert calculation happens in
+                 # the token_dispatcher to overlap communications and computations
+                 output = output + self.shared_experts(hidden_states)
++
++            self._handle_moe_stats_plotting(
++                model_type="moe", device=hidden_states.device
++            )
++            return output, mlp_bias
++
++        if self.moe_layer_recompute:
++            # 作用等价于 PyTorch 的 torch.utils.checkpoint：前向不保存中间激活，反向再把 custom_forward 重跑一遍取回激活，从而显著降低激活显存
++            # 被 checkpoint 的 custom_forward 在反向会再执行一次。因此，里面若有“带副作用”的代码（如日志计数、把路由结果写盘、累加 aux loss），
++            # 需要小心避免重复。Megatron 的 issue 就报告过在 --moe-layer-recompute 下，负载均衡损失会被累计两次的问题
++            result = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
++            if result is None:
++                raise RuntimeError("MoE checkpoint returned no outputs.")
++            output, mlp_bias = result
++        else:
++            output, mlp_bias = custom_forward(hidden_states)
++
++        return output, mlp_bias
++
++
++class MoPELayer(BaseMoELayer):
++    def __init__(
++        self,
++        config: TransformerConfig,
++        submodules: Optional[MoESubmodules] = None,
++        layer_number: Optional[int] = None,
++    ):
++        super(MoPELayer, self).__init__(
++            config=config, submodules=submodules, layer_number=layer_number
++        )
++        # print_rank_0(f"[MoPE] __init__ => building MoPELayer(layer={self.layer_number})")
++        self.moe_layer_recompute = config.moe_layer_recompute
++
++        # 统计产物：均值矩阵/协方差矩阵, mu ∈ [E_global, H]；sigma ∈ [E_global, E_global]
++        E_global = (
++            self.num_local_experts
++            * parallel_state.get_expert_model_parallel_world_size()
++        )
++        # self.normalize_sigma = False  # 是否标准化协方差矩阵为相关性矩阵
++        # 全 0 初始化（CPU，FP32）
++        self.moe_mu = torch.zeros(
++            E_global, self.config.hidden_size, dtype=torch.float32, device="cpu"
++        )
++        self.moe_sigma = torch.eye(E_global, dtype=torch.float32, device="cpu")
++        self.moe_sigma_inv = torch.eye(E_global, dtype=torch.float32, device="cpu")
++        self.moe_sigma_std = torch.eye(E_global, dtype=torch.float32, device="cpu")
++
++        # 内部计数与触发标志
++        self._moe_batch_count: int = 0
++        self._moe_capture_next: bool = True
++        self._cov_eps: float = 1e-12
++
++        # 用共现矩阵构造 sigma, 打开后不再进行稠密前向来统计 sigma
++        self.moe_sigma_from_cooccurrence: bool = True
++
++        # 全局（对本层）在线计数：专家使用与共现（CPU/FP32 或 Long 存）
++        self._coocc_counts = torch.zeros(
++            E_global, E_global, dtype=torch.long, device="cpu"
++        )  # C ∈ [E,E]
++        self._usage_counts = torch.zeros(
++            E_global, dtype=torch.long, device="cpu"
++        )  # u ∈ [E]
++        self._coocc_total_tokens = torch.tensor(
++            0, dtype=torch.long, device="cpu"
++        )  # 累计 token 数
++
++        # 若希望按窗口更新到 router，可重用已有的绘图窗口参数
++        self._sigma_update_every_forwards = int(
++            getattr(self.config, "moe_sigma_update_every", 1) or 1
++        )
++        self._sigma_forward_counter = 0
++        # 数值稳定项（继承你已有 _cov_eps 也可以）
++        self._sigma_eps = 1e-12
++
++        self._init_moe_stats_buffers_if_needed()
++        self.router = self._build_router()
++        self.token_dispatcher = self._build_token_dispatcher()
++        self.experts = self._build_experts()
++        self.shared_experts = self._build_shared_experts()
++
++    def _aggregate_counts_for_sigma(self, device: torch.device):
++        """为了sigma, 把 CPU 计数搬到 device 上做 all_reduce, 再取回 CPU。兼容 EP/TP 聚合。"""
++        C = self._coocc_counts.to(device, non_blocking=True)
++        u = self._usage_counts.to(device, non_blocking=True)
++        N = torch.tensor(
++            [int(self._coocc_total_tokens.item())], dtype=torch.long, device=device
++        )
++
++        # EP 聚合
++        if mpu.get_expert_model_parallel_world_size() > 1:
++            ep_group = mpu.get_expert_model_parallel_group()
++            torch.distributed.all_reduce(
++                C, op=torch.distributed.ReduceOp.SUM, group=ep_group
++            )
++            torch.distributed.all_reduce(
++                u, op=torch.distributed.ReduceOp.SUM, group=ep_group
++            )
++            torch.distributed.all_reduce(
++                N, op=torch.distributed.ReduceOp.SUM, group=ep_group
++            )
++
++        # TP 聚合
++        if mpu.get_tensor_model_parallel_world_size() > 1:
++            tp_group = mpu.get_tensor_model_parallel_group()
++            torch.distributed.all_reduce(
++                C, op=torch.distributed.ReduceOp.SUM, group=tp_group
++            )
++            torch.distributed.all_reduce(
++                u, op=torch.distributed.ReduceOp.SUM, group=tp_group
++            )
++            torch.distributed.all_reduce(
++                N, op=torch.distributed.ReduceOp.SUM, group=tp_group
++            )
++
++        return C.cpu(), u.cpu(), int(N.item())
++
++    def _update_sigma_from_cooccurrence(self, device: torch.device, dtype: torch.dtype):
++        """用累计共现计数 C、使用计数 u, 计算 Sigma = C/N - (u u^T)/N^2, 并推给 router。"""
++        C_cpu, u_cpu, N = self._aggregate_counts_for_sigma(device=device)
++        if N <= 0:
++            return  # 还没统计到任何 token
++
++        #  二阶矩 & 基线（独立假设）
++        C = C_cpu.to(torch.float32)  # [E,E]
++        u = u_cpu.to(torch.float32)  # [E]
++        Nf = float(N)
++
++        second_moment = C / Nf  # C/N
++        baseline = torch.outer(u, u) / (Nf * Nf)  # (u u^T) / N^2  = p p^T
++
++        sigma = second_moment - baseline  # 协方差式的“超额共现”
++
++        # 数值与对称性保护
++        sigma = 0.5 * (sigma + sigma.t())  # 对称化
++        sigma.diagonal().clamp_(min=self._sigma_eps)  # 对角托底，避免为 0/负
++
++        # sigma_for_inv = sigma.clone()
++        # sigma_for_inv.diagonal().clamp_(min=self._sigma_eps)  # 防 0
++        # sigma_inv = torch.linalg.pinv(sigma_for_inv)  # 直接伪逆即可
++        # self.moe_sigma_inv = sigma_inv.to("cpu")
++
++        # 落地CPU主副本，并同步到router（GPU）
++        self.moe_sigma = sigma.to("cpu")
++        if self.router is None:
++            raise RuntimeError("Router is not initialized.")
++        self.router.moe_sigma = sigma.to(device=device, dtype=dtype, non_blocking=True)
++
++    def forward(self, hidden_states: torch.Tensor):
++        if (
++            self.training
++            and self.config.tensor_model_parallel_size > 1
++            and not self.config.sequence_parallel
++        ):
++            raise ValueError(
++                "During training, performance may degrade if MoE and tensor parallelism"
++                "are enabled without also enabling sequence parallelism."
++            )
++
++        # if not hasattr(self, "_dbg2"):
++        #     print(f"[MoPE] forward(layer={self.layer_number})")
++        #     self._dbg2 = True
++
++        self._moe_batch_count += 1
++
++        def custom_forward(hidden_states: torch.Tensor):
++            if (
++                self.router is None
++                or self.token_dispatcher is None
++                or self.experts is None
++            ):
++                raise RuntimeError("MoPE layer modules are not initialized.")
++            # routing
++            probs, routing_map, _ = self.router(hidden_states)
++
++            # plot stats
++            token_per_expert, co_mat = self._maybe_track_routing_stats(routing_map)
++
++            # update sigma from cooccurrence
++            # Only advance sigma statistics during training, and avoid double-counting
++            # under --moe-layer-recompute (checkpointed forward is replayed in backward).
++            should_advance_sigma = (
++                self.training and self._should_count_stats_this_forward()
++            )
++            if (
++                should_advance_sigma
++                and token_per_expert is not None
++                and co_mat is not None
++            ):
++                with torch.no_grad():
++                    # cooccur sigma
++                    T = routing_map.size(0)
++                    token_per_expert_long = token_per_expert.to(torch.long)
++                    co_mat_long = co_mat.to(torch.long)
++                    # 累加到“全层 σ 驱动计数器”（CPU 存主拷贝）
++                    self._usage_counts += token_per_expert_long.cpu()
++                    self._coocc_counts += co_mat_long.cpu()
++                    self._coocc_total_tokens += torch.tensor(T, dtype=torch.long)
++                    # 控制更新频率（每 N 次 forward 更新一次 σ；缺省 N=1）
++                    self._sigma_forward_counter += 1
++                    if self._sigma_forward_counter >= self._sigma_update_every_forwards:
++                        self._update_sigma_from_cooccurrence(
++                            device=hidden_states.device, dtype=torch.float32
++                        )
++                        self._sigma_forward_counter = 0
++
++            # 推理测试导出
++            if not self.training and self.config.test_mode:
++                dump_state = self._ensure_dump_state()
++                # 基于 routing_map 而不是 top-k(probs)
++                selected_indices = routing_map.nonzero(as_tuple=False)  # [N_sel, 2]
++                selected_values = probs[selected_indices[:, 0], selected_indices[:, 1]]
++                torch.save(
++                    (selected_values.cpu(), selected_indices.cpu()),
++                    dump_state.dump_dir / f"{dump_state.cnts}-{dump_state.rank}.pt",
++                )
++                dump_state.cnts += 1
++
++            # dispatch tokens to experts
++            dispatched_input, tokens_per_expert = (
++                self.token_dispatcher.token_permutation(
++                    hidden_states, probs, routing_map
++                )
++            )
++
++            # experts forward
++            expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
++
++            #  mope 额外可视化数据
++            def _collect_covariance_payload(segment_idx):
++                if hasattr(self, "moe_sigma") and self.moe_sigma.numel() > 0:
++                    return {"cov_matrix": self.moe_sigma.detach().cpu().numpy()}
++                return None
++
++            extra_msg = f"capture_next={self._moe_capture_next}"
++            self._handle_moe_stats_plotting(
++                model_type="mope",
++                device=hidden_states.device,
++                extra_message=extra_msg,
++                extra_rank0_dump_fn=_collect_covariance_payload,
++            )
++
++            # token unpermutation
++            output, mlp_bias = self.token_dispatcher.token_unpermutation(
++                expert_output, mlp_bias
++            )
++
++            # shared expert forward
++            # if shared_expert_overlap is True, expert计算已在 dispatcher 中重叠
++            if self.use_shared_expert and not self.shared_expert_overlap:
++                if self.shared_experts is None:
++                    raise RuntimeError("Shared expert module is not initialized.")
++                output = output + self.shared_experts(hidden_states)
+             return output, mlp_bias
+ 
+         if self.moe_layer_recompute:
+-            output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
++            result = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
++            if result is None:
++                raise RuntimeError("MoPE checkpoint returned no outputs.")
++            output, mlp_bias = result
+         else:
+             output, mlp_bias = custom_forward(hidden_states)
+ 
+--- a/megatron/core/transformer/moe/router.py	2026-01-27 21:48:41.075016583 +0800
++++ b/megatron/core/transformer/moe/router.py	2026-01-25 22:29:30.643297264 +0800
+@@ -1,11 +1,15 @@
+ # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ 
++import glob
++import json
++import os
++import re
+ from abc import ABC, abstractmethod
+ from functools import partial
+ from typing import Callable
+ 
++import numpy as np
+ import torch
+-
+ from megatron.core import parallel_state
+ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+ from megatron.core.transformer.module import MegatronModule
+@@ -18,8 +22,105 @@
+     topk_softmax_with_capacity,
+     z_loss_func,
+ )
++from megatron.core.transformer.moe.OT_pruning import otep_batched
+ from megatron.core.transformer.transformer_config import TransformerConfig
+ 
++_COOCCURRENCE_MATRICES_CACHE = None  # {layer_num: np.ndarray}
++
++
++def _parse_moe_mask_experts():
++    """Parse MOE_MASK_EXPERTS JSON like '{"2":[3,17],"5":[10]}'."""
++    env_value = os.environ.get("MOE_MASK_EXPERTS", "").strip()
++    if not env_value:
++        print("[MOE_MASK] env MOE_MASK_EXPERTS is empty, no masking")
++        return {}
++    raw = json.loads(env_value)
++    result = {int(k): set(int(x) for x in v) for k, v in raw.items()}
++    print(f"[MOE_MASK] Parsed MOE_MASK_EXPERTS: {result}")
++    return result
++
++
++# ==================== Dynamic Cooccurrence Mask ====================
++# Environment variables:
++#   MOE_DYNAMIC_MASK_MODE: "cooccurrence" | "random" | "" (disabled)
++#   MOE_COOCCURRENCE_STATS_DIR: path to stats directory with layer*_seg*_moe.npz
++#   MOE_DYNAMIC_MASK_LAYERS: space-separated layer numbers, e.g. "2 5 9"
++
++
++def _load_cooccurrence_matrices():
++    """Load cooccurrence matrices from npz files (called once at startup)."""
++    global _COOCCURRENCE_MATRICES_CACHE
++    if _COOCCURRENCE_MATRICES_CACHE is not None:
++        return _COOCCURRENCE_MATRICES_CACHE
++
++    stats_dir = os.environ.get("MOE_COOCCURRENCE_STATS_DIR", "").strip()
++    layers_str = os.environ.get("MOE_DYNAMIC_MASK_LAYERS", "").strip()
++
++    if not stats_dir or not layers_str:
++        _COOCCURRENCE_MATRICES_CACHE = {}
++        return _COOCCURRENCE_MATRICES_CACHE
++
++    layers = [int(x) for x in layers_str.split()]
++    result = {}
++
++    for layer in layers:
++        pattern = os.path.join(stats_dir, f"layer{layer}_seg*_moe.npz")
++        files = glob.glob(pattern)
++        if not files:
++            print(
++                f"[DYNAMIC_MASK] Warning: no npz files for layer {layer} in {stats_dir}"
++            )
++            continue
++
++        # Find latest segment
++        def seg(path):
++            match = re.search(r"_seg(\d+)_", path)
++            return int(match.group(1)) if match else -1
++
++        latest = max(files, key=seg)
++        data = np.load(latest)
++        C = data["cooccurrence_matrix"].astype(np.float64)
++
++        # Normalize: C_norm[i,j] = C[i,j] / C[i,i]
++        diag = np.maximum(np.diag(C), 1.0)
++        C_norm = C / diag[:, None]
++        np.fill_diagonal(C_norm, 0.0)
++
++        result[layer] = C_norm
++        print(
++            f"[DYNAMIC_MASK] Loaded cooccurrence matrix for layer {layer}: {C_norm.shape} from {os.path.basename(latest)}"
++        )
++
++    _COOCCURRENCE_MATRICES_CACHE = result
++    return result
++
++
++def _parse_dynamic_mask_mode():
++    """Parse MOE_DYNAMIC_MASK_MODE environment variable."""
++    mode = os.environ.get("MOE_DYNAMIC_MASK_MODE", "").strip().lower()
++    if mode not in ("", "cooccurrence", "random"):
++        print(f"[DYNAMIC_MASK] Warning: unknown mode '{mode}', disabling dynamic mask")
++        return ""
++    if mode:
++        print(f"[DYNAMIC_MASK] Dynamic mask mode: {mode}")
++    return mode
++
++
++def _parse_dynamic_mask_seed():
++    """Parse optional MOE_DYNAMIC_MASK_SEED for deterministic random masking."""
++    raw = os.environ.get("MOE_DYNAMIC_MASK_SEED", "").strip()
++    if not raw:
++        return None
++    try:
++        seed = int(raw)
++    except ValueError:
++        print(
++            f"[DYNAMIC_MASK] Warning: invalid MOE_DYNAMIC_MASK_SEED='{raw}', ignoring"
++        )
++        return None
++    print(f"[DYNAMIC_MASK] Dynamic mask seed: {seed}")
++    return seed
++
+ 
+ class Router(ABC, MegatronModule):
+     """Base Router class"""
+@@ -40,12 +141,15 @@
+         # Initialize the gate weights.
+         # TODO: Add support for GPU initialization, which requires updating the golden values.
+         self.weight = torch.nn.Parameter(
+-            torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
++            torch.empty(
++                (self.config.num_moe_experts, self.config.hidden_size),
++                dtype=torch.float32,
++            )
+         )
+         if config.perform_initialization:
+             config.init_method(self.weight)
+         self.weight.data = self.weight.data.to(dtype=config.params_dtype)
+-        setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
++        setattr(self.weight, "sequence_parallel", config.sequence_parallel)
+ 
+     def gating(self, input: torch.Tensor):
+         """Forward pass of the router gate.
+@@ -56,16 +160,18 @@
+         Returns:
+             torch.Tensor: Logits tensor.
+         """
+-        if self.weight.device.type == 'cpu':
++        if self.weight.device.type == "cpu":
+             # move weights to GPU
+             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
+         # Convert to specified datatype for routing computation if enabled
+         router_dtype = input.dtype
+-        if self.config.moe_router_dtype == 'fp32':
++        if self.config.moe_router_dtype == "fp32":
+             router_dtype = torch.float32
+-        elif self.config.moe_router_dtype == 'fp64':
++        elif self.config.moe_router_dtype == "fp64":
+             router_dtype = torch.float64
+-        logits = torch.nn.functional.linear(input.to(router_dtype), self.weight.to(router_dtype))
++        logits = torch.nn.functional.linear(
++            input.to(router_dtype), self.weight.to(router_dtype)
++        )
+         return logits
+ 
+     @abstractmethod
+@@ -110,20 +216,235 @@
+         self.routing_type = self.config.moe_router_load_balancing_type
+         self.score_function = self.config.moe_router_score_function
+         self.input_jitter = None
++        E = self.config.num_moe_experts
++        self.moe_sigma = torch.eye(E, dtype=torch.float32)  # ← 占位
++        self.moe_mu = torch.zeros(E, self.config.hidden_size, dtype=torch.float32)
+ 
+         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+         if self.enable_expert_bias:
+             self.register_buffer(
+-                'local_tokens_per_expert',
++                "local_tokens_per_expert",
+                 torch.zeros(self.config.num_moe_experts, dtype=torch.float32),
+                 persistent=False,
+             )
+             self.register_buffer(
+-                'expert_bias', torch.zeros(self.config.num_moe_experts, dtype=torch.float32)
++                "expert_bias",
++                torch.zeros(self.config.num_moe_experts, dtype=torch.float32),
+             )
+         else:
+             self.local_tokens_per_expert = None
+             self.expert_bias = None
++        self._moe_mask_experts = _parse_moe_mask_experts()
++
++        # Dynamic cooccurrence mask (disabled by default)
++        self._dynamic_mask_mode = _parse_dynamic_mask_mode()
++        self._cooccurrence_matrices = _load_cooccurrence_matrices()
++        self._dynamic_mask_seed = _parse_dynamic_mask_seed()
++        self._dynamic_mask_rng = {}
++
++        # OTEP warm-up: use standard topk during warm-up period
++        self._otep_warmup_fraction = getattr(config, "moe_otep_warmup_fraction", 0.01)
++        # Use register_buffer so _otep_batch_count is part of model state (but not saved to checkpoint)
++        self.register_buffer(
++            "_otep_batch_count", torch.tensor(0, dtype=torch.long), persistent=False
++        )
++        self._otep_warmup_batches = None  # will be set on first forward
++
++    def _is_in_otep_warmup(self) -> bool:
++        """Check if we are still in OTEP warm-up period.
++
++        Only applies during training. Inference always uses OTEP.
++        """
++        if not self.training:
++            return False
++        if self._otep_warmup_fraction <= 0:
++            return False
++        # Lazy init: compute warmup batches from train_iters on first call
++        if self._otep_warmup_batches is None:
++            try:
++                from megatron.core.num_microbatches_calculator import (
++                    get_num_microbatches,
++                )
++                from megatron.training.global_vars import get_args
++
++                args = get_args()
++                train_iters = getattr(args, "train_iters", None) or 0
++                num_mbs = get_num_microbatches()
++                # Convert train_iters (optimizer steps) to microbatch count
++                self._otep_warmup_batches = int(
++                    train_iters * self._otep_warmup_fraction * num_mbs
++                )
++            except Exception:
++                self._otep_warmup_batches = 0
++        return self._otep_batch_count.item() <= self._otep_warmup_batches
++
++    def _apply_expert_mask(self, logits: torch.Tensor) -> torch.Tensor:
++        if self.layer_number is None or not self._moe_mask_experts:
++            return logits
++        mask = self._moe_mask_experts.get(self.layer_number)
++        if not mask:
++            return logits
++        num_experts = logits.shape[-1]
++        masked = [idx for idx in mask if 0 <= idx < num_experts]
++        # Debug: print once per layer
++        if not getattr(self, "_mask_debug_printed", False):
++            print(
++                f"[MOE_MASK] Layer {self.layer_number}: masking {len(masked)} experts: {sorted(masked)}"
++            )
++            self._mask_debug_printed = True
++        neg_inf = torch.finfo(logits.dtype).min
++        logits[:, masked] = neg_inf
++        return logits
++
++    def _apply_dynamic_cooccurrence_mask(
++        self,
++        scores: torch.Tensor,
++        routing_map: torch.Tensor,
++    ) -> tuple:
++        """Apply dynamic cooccurrence-based mask to routing results (vectorized).
++
++        For each token, among its selected top-k experts:
++        - cooccurrence mode: mask the expert in the highest cooccurrence pair
++        - random mode: mask a random expert
++
++        Args:
++            scores: [num_tokens, num_experts] routing weights
++            routing_map: [num_tokens, num_experts] bool, True for selected experts
++
++        Returns:
++            (scores, routing_map) with one expert masked per token (k -> k-1)
++        """
++        if not self._dynamic_mask_mode:
++            return scores, routing_map
++
++        if self.layer_number is None:
++            return scores, routing_map
++
++        C_norm = self._cooccurrence_matrices.get(self.layer_number)
++        if C_norm is None:
++            return scores, routing_map
++
++        device = scores.device
++        num_tokens, num_experts = scores.shape
++        topk = self.topk
++        selected_counts = routing_map.sum(dim=1)
++
++        if topk <= 1:
++            return scores, routing_map
++
++        # Convert cooccurrence matrix to tensor (cached)
++        if not hasattr(self, "_C_norm_tensor") or self._C_norm_tensor is None:
++            self._C_norm_tensor = {}
++        if self.layer_number not in self._C_norm_tensor:
++            self._C_norm_tensor[self.layer_number] = torch.from_numpy(C_norm).to(
++                device=device, dtype=scores.dtype
++            )
++        C_tensor = self._C_norm_tensor[self.layer_number]
++
++        if not getattr(self, "_dynamic_mask_underfull_warned", False):
++            underfull = selected_counts < topk
++            if underfull.any():
++                num_underfull = int(underfull.sum().item())
++                print(
++                    f"[DYNAMIC_MASK] Layer {self.layer_number}: {num_underfull}/{num_tokens} "
++                    f"tokens have <{topk} selected experts; skipping dynamic mask for those tokens"
++                )
++                self._dynamic_mask_underfull_warned = True
++
++        # Get top-k indices for each token [T, k]
++        # Use scores to get indices (nonzero positions in routing_map)
++        masked_scores = scores.masked_fill(~routing_map, float("-inf"))
++        topk_scores, top_indices = masked_scores.topk(topk, dim=1)  # [T, k]
++        valid = torch.isfinite(topk_scores)
++        mask_tokens = selected_counts >= 2
++
++        if self._dynamic_mask_mode == "cooccurrence":
++            # Vectorized cooccurrence mask:
++            # 1. Build [T, k, k] cooccurrence submatrices
++            # 2. Find max off-diagonal element per token
++            # 3. Mask the j expert from max pair
++
++            # Gather cooccurrence values: C[top_indices[t,i], top_indices[t,j]]
++            # Use advanced indexing: C_tensor[top_indices] -> [T, k, E]
++            # Then gather again for second dimension
++            idx_i = top_indices.unsqueeze(2).expand(-1, -1, topk)  # [T, k, k]
++            idx_j = top_indices.unsqueeze(1).expand(-1, topk, -1)  # [T, k, k]
++
++            # Gather: sub_C[t, i, j] = C_tensor[top_indices[t,i], top_indices[t,j]]
++            sub_C = C_tensor[idx_i, idx_j]  # [T, k, k]
++
++            # Mask diagonal (set to -inf)
++            diag_mask = torch.eye(topk, device=device, dtype=torch.bool).unsqueeze(0)
++            sub_C = sub_C.masked_fill(diag_mask, float("-inf"))
++
++            # Mask invalid (non-selected) positions
++            valid_pairs = valid.unsqueeze(2) & valid.unsqueeze(1)
++            sub_C = sub_C.masked_fill(~valid_pairs, float("-inf"))
++
++            # Find argmax in flattened [T, k*k] -> get j index
++            flat_max_idx = sub_C.view(num_tokens, -1).argmax(dim=1)  # [T]
++            j_local = flat_max_idx % topk  # [T], local index within top-k
++
++            # Get the actual expert index to mask
++            experts_to_mask = top_indices.gather(1, j_local.unsqueeze(1)).squeeze(
++                1
++            )  # [T]
++
++        elif self._dynamic_mask_mode == "random":
++            # Vectorized random mask:
++            # Generate random index [0, topk) for each token
++            rng = None
++            if self._dynamic_mask_seed is not None:
++                rng = self._dynamic_mask_rng.get(device)
++                if rng is None:
++                    rng = torch.Generator(device=device)
++                    rng.manual_seed(self._dynamic_mask_seed)
++                    self._dynamic_mask_rng[device] = rng
++
++            if rng is None:
++                rand_uniform = torch.rand(num_tokens, device=device)
++            else:
++                rand_uniform = torch.rand(num_tokens, device=device, generator=rng)
++            rand_idx = (
++                (rand_uniform * selected_counts.clamp(min=1).to(rand_uniform.dtype))
++                .floor()
++                .long()
++            )
++
++            # Get the actual expert index to mask
++            experts_to_mask = top_indices.gather(1, rand_idx.unsqueeze(1)).squeeze(
++                1
++            )  # [T]
++
++        else:
++            return scores, routing_map
++
++        # Build mask_to_remove using scatter
++        mask_to_remove = torch.zeros(
++            num_tokens, num_experts, dtype=torch.bool, device=device
++        )
++        mask_to_remove.scatter_(1, experts_to_mask.unsqueeze(1), True)
++        mask_to_remove &= mask_tokens.unsqueeze(1)
++
++        # Apply mask
++        new_routing_map = routing_map & ~mask_to_remove
++        new_scores = scores.clone()
++        new_scores[mask_to_remove] = 0.0
++
++        # Renormalize scores
++        score_sums = new_scores.sum(dim=1, keepdim=True)
++        new_scores = new_scores / (score_sums + 1e-9)
++
++        # Debug: print once per layer
++        if not getattr(self, "_dynamic_mask_debug_printed", False):
++            masked_count = mask_to_remove.sum().item()
++            print(
++                f"[DYNAMIC_MASK] Layer {self.layer_number}: mode={self._dynamic_mask_mode}, "
++                f"masked {masked_count}/{num_tokens} tokens"
++            )
++            self._dynamic_mask_debug_printed = True
++
++        return new_scores, new_routing_map
+ 
+     def sinkhorn_load_balancing(self, logits: torch.Tensor):
+         """Apply sinkhorn routing to the logits tensor.
+@@ -140,12 +461,16 @@
+             if self.topk == 1:
+                 logits = torch.sigmoid(logits)
+             else:  # k > 1
+-                logits = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
++                logits = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(
++                    logits
++                )
+             return logits
+ 
+-        assert self.config.moe_aux_loss_coeff == 0, "Sinkhorn routing does not support aux loss."
++        assert self.config.moe_aux_loss_coeff == 0, (
++            "Sinkhorn routing does not support aux loss."
++        )
+         if self.training:
+-            with torch.no_grad():
++            with torch.no_grad():  # 用于包裹需要禁用梯度计算的代码段
+                 norm_logits = sinkhorn(
+                     logits.to(dtype=torch.float32)
+                 )  # explicit fp32 conversion for stability
+@@ -160,7 +485,8 @@
+ 
+     def aux_loss_load_balancing(self, logits: torch.Tensor):
+         """Apply loss-based load balancing to the logits tensor.
+-
++        定义一个辅助损失 switch_load_balancing_loss_func，度量专家使用的不均衡程度，
++        然后在 apply_load_balancing_loss 中将这部分损失合并到模型训练中
+         Args:
+             logits (torch.Tensor): the logits tensor after gating, shape: [num_tokens, num_experts].
+ 
+@@ -168,6 +494,7 @@
+             probs (torch.Tensor): The probabilities of token to experts assignment.
+             routing_map (torch.Tensor): The mask of token to experts assignment.
+         """
++        # 考虑 expert capacity（容量限制），即每个专家最多接收 capacity_factor × (num_tokens / num_experts) 个 token，避免个别专家负载过重
+         probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
+             logits,
+             self.topk,
+@@ -197,7 +524,9 @@
+             )
+         return probs, routing_map
+ 
+-    def seq_aux_loss_load_balancing(self, logits: torch.Tensor, bsz: int, seq_length: int):
++    def seq_aux_loss_load_balancing(
++        self, logits: torch.Tensor, bsz: int, seq_length: int
++    ):
+         """Apply loss-based load balancing to the logits tensor."""
+ 
+         probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
+@@ -243,10 +572,13 @@
+             sequence_partition_group = parallel_state.get_context_parallel_group()
+             moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
+         elif parallel_state.get_tensor_and_context_parallel_world_size() > 1:
+-            sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
++            sequence_partition_group = (
++                parallel_state.get_tensor_and_context_parallel_group()
++            )
+ 
+         aux_loss = load_balancing_loss_func(
+-            moe_aux_loss_coeff=moe_aux_loss_coeff, sequence_partition_group=sequence_partition_group
++            moe_aux_loss_coeff=moe_aux_loss_coeff,
++            sequence_partition_group=sequence_partition_group,
+         )
+         save_to_aux_losses_tracker(
+             "load_balancing_loss",
+@@ -276,7 +608,10 @@
+             z_loss = z_loss_func(logits, moe_z_loss_coeff)
+             logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+             save_to_aux_losses_tracker(
+-                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, self.config.num_layers
++                "z_loss",
++                z_loss / moe_z_loss_coeff,
++                self.layer_number,
++                self.config.num_layers,
+             )
+         return logits
+ 
+@@ -322,12 +657,16 @@
+             # Gather the logits from the TP region
+             logits = gather_from_sequence_parallel_region(logits)
+ 
+-        if self.routing_type == "sinkhorn":
++        logits = self._apply_expert_mask(logits)
++
++        if self.routing_type == "sinkhorn":  # default is aux_loss
+             scores, routing_map = self.sinkhorn_load_balancing(logits)
+         elif self.routing_type == "aux_loss":
+             scores, routing_map = self.aux_loss_load_balancing(logits)
+         elif self.routing_type == "seq_aux_loss":
+-            scores, routing_map = self.seq_aux_loss_load_balancing(logits, bsz, seq_length)
++            scores, routing_map = self.seq_aux_loss_load_balancing(
++                logits, bsz, seq_length
++            )
+         elif self.routing_type == "none":
+             # A naive top-k routing without load balancing
+             scores, routing_map, _ = topk_softmax_with_capacity(
+@@ -344,13 +683,150 @@
+                 score_function=self.score_function,
+                 expert_bias=self.expert_bias,
+             )
++        # elif self.routing_type == "otep":
++        #     # ---------- 1) 先用标准 top-k Softmax with capacity ----------
++        #     scores, routing_map, _ = topk_softmax_with_capacity(
++        #         logits,
++        #         self.topk,
++        #         capacity_factor=self.config.moe_expert_capacity_factor,
++        #         pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
++        #         drop_policy=self.config.moe_token_drop_policy,
++        #         use_pre_softmax=self.config.moe_router_pre_softmax,
++        #         num_groups=self.config.moe_router_num_groups,
++        #         group_topk=self.config.moe_router_group_topk,
++        #         scaling_factor=self.config.moe_router_topk_scaling_factor,
++        #         deterministic_mode=self.config.deterministic_mode,
++        #         score_function=self.score_function,
++        #         expert_bias=self.expert_bias,
++        #     )  # scores:[T,E] routing_map:[T,E]
++        #
++        #     # # ---------- 2) 逐-token 调用 OTEP，得到新路由 ----------
++        #     # if self.moe_sigma is None:
++        #     #     raise RuntimeError("OTEP routing selected but `self.moe_sigma` is None. "
++        #     #                        "Please inject sigma from MoELayer statistics.")
++        #     # sigma_np = self.moe_sigma.cpu().numpy()  # (E,E) 只拷一次
++        #     #
++        #     # T, E = scores.shape
++        #     # device = scores.device
++        #     # new_routing = torch.zeros_like(routing_map)  # Bool 0
++        #     #
++        #     # for t in range(T):  # 逐 token
++        #     #     mu_np = scores[t].detach().cpu().numpy()  # (E,)
++        #     #     sel_vec = ot_based_ensemble_pruning(mu_np, sigma_np, k=self.topk)  # ndarray 0/1
++        #     #     mask_t = torch.as_tensor(sel_vec, dtype=torch.bool, device=device)  # (E,)
++        #     #     new_routing[t] = mask_t
++        #     #
++        #     # routing_map = new_routing  # 更新路由
++        #     # batched version
++        #     routing_map = otep_batched(scores, self.moe_sigma.to(scores.device, dtype=scores.dtype), self.topk)
++        #     scores = scores * routing_map
++
++        elif self.routing_type == "otep":
++            # OTEP warm-up: use standard topk during warm-up period
++            # Only count during first forward pass (not recompute in backward)
++            # In Megatron checkpoint: first forward has grad disabled, recompute has grad enabled
++            if self.training and not torch.is_grad_enabled():
++                self._otep_batch_count += 1
++            in_warmup = self._is_in_otep_warmup()
++
++            if in_warmup:
++                # During warm-up, use standard aux_loss routing (same as aux_loss branch)
++                scores, routing_map, tokens_per_expert = topk_softmax_with_capacity(
++                    logits,
++                    self.topk,
++                    capacity_factor=self.config.moe_expert_capacity_factor,
++                    pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
++                    drop_policy=self.config.moe_token_drop_policy,
++                    use_pre_softmax=self.config.moe_router_pre_softmax,
++                    num_groups=self.config.moe_router_num_groups,
++                    group_topk=self.config.moe_router_group_topk,
++                    scaling_factor=self.config.moe_router_topk_scaling_factor,
++                    deterministic_mode=self.config.deterministic_mode,
++                    score_function=self.score_function,
++                    expert_bias=self.expert_bias,
++                )
++
++                # Compute probs_full for consistency with post-warmup phase
++                probs_full = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
++
++                if self.training and self.config.moe_aux_loss_coeff:
++                    probs_for_aux = torch.softmax(logits, dim=-1, dtype=torch.float32)
++                    aux_loss_func = partial(
++                        switch_load_balancing_loss_func,
++                        probs=probs_for_aux,
++                        tokens_per_expert=tokens_per_expert,
++                        topk=self.topk,
++                    )
++                    scores = self.apply_load_balancing_loss(
++                        activation=scores, load_balancing_loss_func=aux_loss_func
++                    )
++            else:
++                # After warm-up, use OTEP routing
++                # 0) 用"完整 logits"得到概率，喂给 OTEP 产生每个 token 的 K-候选集合
++                probs_full = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(
++                    logits
++                )  # [T,E]
++                otep_mask = otep_batched(
++                    probs_full,
++                    self.moe_sigma.to(probs_full.device, dtype=probs_full.dtype),
++                    self.topk,  # 每行恰好 K 个 True
++                )  # [T,E] bool
++
++                # 1) 把不在 OTEP 候选集的专家硬性屏蔽：
++                #    - 选 top-k（这一步会在被屏蔽后只能在 OTEP 的 K 个里选）
++                #    - 归一化得到路由权重
++                #    - 应用容量约束（capacity_factor）
++                #    - 按 drop_policy 丢弃超额 token（不"改派"到第 k+1）
++                #    - 可选 pad_to_capacity
++                masked_logits = logits.masked_fill(~otep_mask, float("-inf"))
++
++                scores, routing_map, tokens_per_expert = topk_softmax_with_capacity(
++                    masked_logits,
++                    self.topk,
++                    capacity_factor=self.config.moe_expert_capacity_factor,
++                    pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
++                    drop_policy=self.config.moe_token_drop_policy,
++                    use_pre_softmax=self.config.moe_router_pre_softmax,
++                    num_groups=self.config.moe_router_num_groups,
++                    group_topk=self.config.moe_router_group_topk,
++                    scaling_factor=self.config.moe_router_topk_scaling_factor,
++                    deterministic_mode=self.config.deterministic_mode,
++                    score_function=self.score_function,
++                    expert_bias=self.expert_bias,
++                )
++                # notes:
++                # - scores: [T,E]，每行最多 K 个非零（经 capacity/drop 后，超额被置 0）
++                # - routing_map: [T,E] bool，经 capacity/drop 后的最终分配（超额为 False）
++                # - tokens_per_expert: [E]，每个专家最终接收的 token 数（不含 pad）
++
++                # 2) 叠加 MoE 的 aux-loss（与 "aux_loss" 分支一致）
++                if self.training and self.config.moe_aux_loss_coeff:
++                    # 用"未屏蔽的原 logits"的 softmax 作为 probs（与官方实现一致）
++                    probs_for_aux = torch.softmax(logits, dim=-1, dtype=torch.float32)
++                    aux_loss_func = partial(
++                        switch_load_balancing_loss_func,  # 如果你想要样本级别的 seq-aux-loss，换成 sequence_load_balancing_loss_func
++                        probs=probs_for_aux,
++                        tokens_per_expert=tokens_per_expert,
++                        topk=self.topk,
++                    )
++                    scores = self.apply_load_balancing_loss(
++                        activation=scores,  # 把负载均衡损失挂在当前用于加权的路由权重上
++                        load_balancing_loss_func=aux_loss_func,
++                    )
++
+         else:
+             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
++
++        # Apply dynamic cooccurrence mask (if enabled)
++        # This masks one expert per token based on cooccurrence or random selection
++        scores, routing_map = self._apply_dynamic_cooccurrence_mask(scores, routing_map)
++
+         # Prevent extra local tokens accumulation on evaluation or activation recomputation
+         if self.enable_expert_bias and torch.is_grad_enabled():
+             with torch.no_grad():
+                 self.local_tokens_per_expert += routing_map.sum(dim=0)
+-
++        if self.routing_type == "otep":
++            return scores, routing_map, probs_full
+         return scores, routing_map
+ 
+     def forward(self, input: torch.Tensor):
+@@ -365,6 +841,9 @@
+         input = self.apply_input_jitter(input)
+         logits = self.gating(input)
+ 
+-        scores, routing_map = self.routing(logits)
++        if self.routing_type == "otep":
++            scores, routing_map, probs_full = self.routing(logits)
++            return scores, routing_map, probs_full
+ 
++        scores, routing_map = self.routing(logits)
+         return scores, routing_map
+--- a/megatron/core/transformer/moe/OT_pruning.py	1970-01-01 08:00:00.000000000 +0800
++++ b/megatron/core/transformer/moe/OT_pruning.py	1970-01-01 08:00:00.000000000 +0800
+@@ -0,0 +1,385 @@
++import numpy as np
++import torch
++
++def ot_based_ensemble_pruning(prob, sigma, k: int):
++    """
++    prob: (E,)  —— 单个 token 的专家概率向量（mu_i）
++    sigma: (E,E) —— 全局专家协方差
++    k: 选多少个专家
++    返回: 0/1 向量 (E,)
++    """
++    p = np.asarray(prob,  dtype=np.float64)     # 统一到 numpy
++    Sx = np.asarray(sigma, dtype=np.float64)
++    E = Sx.shape[0]
++    eps = 1e-12
++
++    # 选第一个：argmax p_i^2 / Sigma[i,i]
++    diag = np.clip(np.diag(Sx), eps, None)
++    scores0 = (p * p) / diag
++    S = [int(np.argmax(scores0))]
++
++    # R 的初始化（逆 Cholesky 的对角块）
++    R = np.array([[1.0 / np.sqrt(diag[S[0]])]], dtype=np.float64)
++
++    for t in range(1, k):
++        # print("====== k=%d =====" % t)
++        cand = list(set(range(E)) - set(S))
++        best_score = -np.inf
++        best_idx = -1
++        best_R = None
++
++        # 预取已选的列（避免重复索引开销）
++        for j in cand:
++            beta_j = Sx[S, j]                    # shape: (t,)
++            b_jj  = Sx[j, j]
++
++            alpha_j = R @ beta_j                 # (t,)
++            s = float(b_jj - alpha_j @ alpha_j)  # Schur 补
++            if s <= eps:                         # 数值稳定
++                s = eps
++            r_j = 1.0 / np.sqrt(s)               # 标量
++
++            gamma_j = (-r_j * alpha_j.reshape(1, -1)) @ R   # (1, t)
++
++            # 组装扩展后的 R（(t+1)×(t+1)）
++            R_j = np.block([
++                [R,                      np.zeros((R.shape[0], 1), dtype=np.float64)],
++                [gamma_j.astype(np.float64),      np.array([[r_j]], dtype=np.float64)]
++            ])
++
++            # 计算分数：|| R_j @ p_sub ||^2
++            idx = S + [j]
++            p_sub = p[idx].reshape(-1, 1)        # (t+1, 1)
++            sc = float((R_j @ p_sub).T @ (R_j @ p_sub))
++            if sc > best_score:
++                best_score, best_idx, best_R = sc, j, R_j
++
++        S.append(best_idx)
++        R = best_R
++
++    out = np.zeros(E, dtype=int)
++    out[S] = 1
++    # print("final score:", out * prob)
++    return out
++
++
++@torch.no_grad()
++def otep_batched(scores: torch.Tensor, sigma: torch.Tensor, k: int, eps: float = 1e-12) -> torch.Tensor:
++    """
++    批量版 OTEP 选择
++    scores: [T, E]  —— 每个 token 的专家概率向量
++    sigma : [E, E]  —— 全局专家协方差（对称、半正定，建议已加 jitter）
++    k     : 需要选择的专家个数
++    返回  : [T, E] 的 bool 路由 mask（每行恰有 k 个 True）
++    """
++    assert scores.dim() == 2 and sigma.dim() == 2
++    T, E = scores.shape
++    assert sigma.shape == (E, E)
++    device = scores.device
++    dtype  = scores.dtype
++
++    # 预计算对角（数值稳定）
++    diag = torch.diag(sigma).clamp_min(eps)                     # [E]
++    inv_sqrt_diag = diag.rsqrt()                                # 1/sqrt(diag)
++
++    # 结果容器
++    selected_mask = torch.zeros(T, E, dtype=torch.bool, device=device)
++    selected_idx  = torch.full((T, k), -1, dtype=torch.long, device=device) # 全是-1的矩阵
++
++    # 逆 Cholesky 因子 R 与 z=R p_S 的“打包”缓冲（仅用左上 t×t）
++    R = torch.zeros(T, k, k, dtype=dtype, device=device)        # 每个 token 一份 R
++    z = torch.zeros(T, k, dtype=dtype, device=device)       # 每个 token 一份 z
++    # z_norm_sq = torch.zeros(T, dtype=dtype, device=device)      # ||z||^2
++
++    # ====== 第 0 轮：一次性选第一个专家 j0（向量化） ======
++    score0 = (scores ** 2) / diag.unsqueeze(0)                  # [T,E]
++    j0 = torch.argmax(score0, dim=1)                            # [T] 列与列之间进行比较，所以返回每一行的最大值
++    selected_idx[:, 0] = j0
++    selected_mask.scatter_(1, j0.unsqueeze(1), True)
++
++    # 初始化 R、z、||z||^2
++    R[:, 0, 0] = inv_sqrt_diag.gather(0, j0)                    # R00 = 1/sqrt(Σ[j0,j0]) torch.gather:根据指定的索引从输入张量中收集元素
++    z[:, 0]    = R[:, 0, 0] * scores.gather(1, j0.unsqueeze(1)).squeeze(1)  # z0 = R00 * p_j0 score的第i行都取j0的第i个元素
++    z_norm_sq  = z[:, 0] ** 2
++
++    # 到这没问题
++    # ====== 其余 k-1 轮：每轮对 (T,E) 一次性打分 ======
++    for t in range(1, k): # 1,...,7
++        # 取已选索引 S（每个 token 一行，长度 t）
++        S_t = selected_idx[:, :t]                               # [T,t]
++
++        # Σ[S, :] ：用高级索引获得 [T,t,E]（每个 token 的 t 行）
++        # 注意：sigma[S_t, :] 要求 S_t 的两维是 LongTensor
++        beta = sigma[S_t, :]                                    # [T,t,E]
++
++        # α = R * β  （batched： [T,t,t] @ [T,t,E] -> [T,t,E]）
++        R_tt = R[:, :t, :t]                                     # [T,t,t]
++        alpha = torch.bmm(R_tt, beta)                           # [T,t,E] 把所有列的aj都算了一下
++
++        # s_j = Σ[j,j] - ||α_j||^2
++        a2 = alpha.pow(2).sum(dim=1)                            # [T,E]
++        s  = diag.unsqueeze(0) - a2                             # [T,E]
++        s  = torch.clamp(s, min=eps)
++        r  = s.rsqrt()                                          # [T,E]
++
++        # a^T z  （z: [T,k]；alpha: [T,t,E]）
++        # 先扩展 z 以匹配 alpha 的 t 维，再在 t 上做内积             ???对吗, 对
++        aTz = (alpha * z[:, :t].unsqueeze(2)).sum(dim=1)        # [T,E]
++
++        # 每个候选 j 的得分：||z||^2 + (r*(p_j - a^T z))^2
++        delta = scores - aTz                                    # [T,E]
++        cand_score = z_norm_sq.unsqueeze(1) + (r * delta).pow(2)  # [T,E]
++
++        # 屏蔽已选过的专家
++        cand_score = cand_score.masked_fill(selected_mask, float('-inf'))
++
++        # 选本轮的最佳 j*
++        j_star = torch.argmax(cand_score, dim=1)                # [T]
++        selected_idx[:, t] = j_star
++        selected_mask.scatter_(1, j_star.unsqueeze(1), True)
++
++        # 取出所选 j* 对应的 α*, s*, r*
++        arng = torch.arange(T, device=device)
++        alpha_sel = alpha[arng, :, j_star]                      # [T,t]
++        s_sel     = s[arng, j_star]                             # [T]
++        r_sel     = s_sel.rsqrt()                               # [T]
++
++        # 更新 z 的新分量：z_new = r*(p_j - α^T z)
++        delta_sel = delta[arng, j_star]                         # [T]
++        z_new     = r_sel * delta_sel                           # [T]
++        z[:, t]   = z_new
++        z_norm_sq = z_norm_sq + z_new.pow(2)
++
++        # 更新 R 的新行/新列（块构造）：
++        # gamma = - r * α^T R    （1×t），批量化： [T,1,t] = [T,1,t] @ [T,t,t]
++        gamma = - r_sel.view(T, 1, 1) * torch.bmm(alpha_sel.unsqueeze(1), R_tt)  # [T,1,t]
++
++        # 写入 R 的新块
++        R[:, t, :t] = gamma.squeeze(1)                          # 下三角新行
++        R[:, :t, t] = 0                                         # 上三角新列（全 0）
++        R[:, t, t]  = r_sel                                     # 右下角标量
++        # 其他元素保持不变（左上 t×t）
++
++    return selected_mask
++
++
++
++@torch.no_grad()
++def otep_batched_chunked(
++    scores: torch.Tensor,     # [T, E]，每个 token 的专家概率
++    sigma:  torch.Tensor,     # [E, E]，全局专家协方差
++    k: int,
++    chunk_size: int = 256,
++    eps: float = 1e-12,
++) -> torch.BoolTensor:
++    """
++    低显存版批量 OTEP：按专家维分块（E 方向 chunk）。
++    返回 [T, E] 的 bool 路由 mask（每行正好 k 个 True）。
++    """
++    assert scores.dim() == 2 and sigma.dim() == 2
++    T, E = scores.shape
++    assert sigma.shape == (E, E)
++    device, dtype = scores.device, scores.dtype
++
++    scores = scores.to(device=device, dtype=dtype)
++    sigma  = sigma.to(device=device, dtype=dtype)
++
++    # 结果容器
++    selected_mask = torch.zeros(T, E, dtype=torch.bool, device=device)
++    selected_idx  = torch.full((T, k), -1, dtype=torch.long, device=device)
++
++    # 预计算对角
++    diag = torch.diag(sigma).clamp_min(eps)        # [E]
++    inv_sqrt_diag = diag.rsqrt()                   # [E]
++
++    # 逆 Cholesky 与 z=R p_S 的打包缓冲（仅用左上 t×t / 前 t 元素）
++    R = torch.zeros(T, k, k, dtype=dtype, device=device)   # [T,k,k]
++    z = torch.zeros(T, k,     dtype=dtype, device=device)  # [T,k]
++    z_norm_sq = torch.zeros(T, dtype=dtype, device=device) # [T]
++
++    # ==================== 第 0 轮：分块在 E 上做 argmax ====================
++    best0 = torch.full((T,), float("-inf"), dtype=dtype, device=device)
++    j0    = torch.full((T,), -1,           dtype=torch.long, device=device)
++
++    for start in range(0, E, chunk_size):
++        J = torch.arange(start, min(start + chunk_size, E), device=device)
++        # (scores[:,J]**2) / diag[J]
++        s_chunk = scores[:, J]                                # [T,C]
++        d_chunk = diag[J]                                     # [C]
++        sc0 = (s_chunk * s_chunk) / d_chunk.unsqueeze(0)      # [T,C]
++        # 按行更新 argmax
++        local_best, local_idx = torch.max(sc0, dim=1)         # [T], [T]
++        update = local_best > best0
++        j0[update]    = J[local_idx[update]]
++        best0[update] = local_best[update]
++
++    # 记录第一个专家
++    selected_idx[:, 0] = j0
++    selected_mask.scatter_(1, j0.unsqueeze(1), True)
++
++    # 初始化 R、z、||z||^2
++    R[:, 0, 0] = inv_sqrt_diag.gather(0, j0)  # R00 = 1/sqrt(Σ[j0,j0])
++    z0 = R[:, 0, 0] * scores.gather(1, j0.unsqueeze(1)).squeeze(1)
++    z[:, 0] = z0
++    z_norm_sq = z0 * z0
++
++    # ==================== 后续 k-1 轮 ====================
++    for t in range(1, k):
++        S_t = selected_idx[:, :t]                       # [T,t]
++        R_tt = R[:, :t, :t]                             # [T,t,t]
++        z_t  = z[:, :t]                                 # [T,t]
++
++        best = torch.full((T,), float("-inf"), dtype=dtype, device=device)
++        j_star = torch.full((T,), -1, dtype=torch.long, device=device)
++
++        for start in range(0, E, chunk_size):
++            J = torch.arange(start, min(start + chunk_size, E), device=device)
++            C = J.numel()
++
++            # beta = Σ[S, J]  → 通过列切 + 行 gather 实现： [T,t,C]
++            sigma_J = sigma.index_select(1, J)                  # [E,C]
++            sigma_J_exp = sigma_J.unsqueeze(0).expand(T, -1, -1)  # [T,E,C]
++            row_index = S_t.unsqueeze(-1).expand(T, t, C)       # [T,t,C]
++            beta = torch.gather(sigma_J_exp, 1, row_index)      # [T,t,C]
++
++            # alpha = R * beta  （batched）: [T,t,t] @ [T,t,C] -> [T,t,C]
++            alpha = torch.bmm(R_tt, beta)                       # [T,t,C]
++
++            # s_j = Σ[j,j] - ||α_j||^2
++            a2 = alpha.pow(2).sum(dim=1)                        # [T,C]
++            s = diag[J].unsqueeze(0) - a2                       # [T,C]
++            s = torch.clamp(s, min=eps)
++            r = s.rsqrt()                                       # [T,C]
++
++            # a^T z
++            aTz = (alpha * z_t.unsqueeze(2)).sum(dim=1)         # [T,C]
++
++            # cand_score = ||z||^2 + (r*(p_j - a^T z))^2
++            p_chunk = scores[:, J]                               # [T,C]
++            delta = p_chunk - aTz                                # [T,C]
++            sc = z_norm_sq.unsqueeze(1) + (r * delta).pow(2)     # [T,C]
++
++            # 屏蔽已选专家
++            sc = sc.masked_fill(selected_mask[:, J], float('-inf'))
++
++            # 在本 chunk 内更新全局最优
++            local_best, local_idx = torch.max(sc, dim=1)         # [T]
++            update = local_best > best
++            j_star[update] = J[local_idx[update]]
++            best[update]   = local_best[update]
++
++        # 记录本轮选择
++        selected_idx[:, t] = j_star
++        selected_mask.scatter_(1, j_star.unsqueeze(1), True)
++
++        # 取出所选 j* 的 alpha*, s*, r* 以更新 R 与 z
++        arng = torch.arange(T, device=device)
++
++        # 为了得到 alpha_sel: 需要再次取 Σ[S, j*] 并做一次 alpha = R_tt @ beta_sel
++        # 先取 beta_sel: [T,t]
++        sigma_j = sigma.index_select(1, j_star)                 # [E,T]
++        sigma_j = sigma_j.transpose(0,1)                        # [T,E]
++        beta_sel = torch.gather(sigma_j, 1, S_t)                # [T,t]
++        alpha_sel = torch.bmm(R_tt, beta_sel.unsqueeze(2)).squeeze(2)  # [T,t]
++
++        # s_sel, r_sel
++        s_sel = (diag.gather(0, j_star) - (alpha_sel * alpha_sel).sum(dim=1)).clamp_min(eps)  # [T]
++        r_sel = s_sel.rsqrt()                                                                        # [T]
++
++        # z_new
++        p_sel = scores.gather(1, j_star.unsqueeze(1)).squeeze(1)                       # [T]
++        aTz_sel = (alpha_sel * z_t).sum(dim=1)                                         # [T]
++        z_new = r_sel * (p_sel - aTz_sel)                                              # [T]
++        z[:, t] = z_new
++        z_norm_sq = z_norm_sq + z_new.pow(2)
++
++        # 更新 R 的新行/列
++        gamma = - r_sel.view(T, 1, 1) * torch.bmm(alpha_sel.unsqueeze(1), R_tt)        # [T,1,t]
++        R[:, t, :t] = gamma.squeeze(1)                                                 # 下三角
++        R[:, :t, t] = 0                                                                # 上三角
++        R[:, t, t]  = r_sel
++
++    return selected_mask
++
++
++@torch.no_grad()
++def otep_batched_shuffle(
++    scores: torch.Tensor,
++    sigma: torch.Tensor,
++    k: int,
++    n_shuffles: int = 8,
++    random_state: int | None = None,
++    tie_break: str = "none"  # "score" | "random" | "none"
++):
++    """
++    多次对专家维度随机置换，调用 otep_batched 进行选择，汇总出现频次后取 Top-k。
++
++    参数
++    ----
++    scores : [T, E]       每个 token 的专家概率向量
++    sigma  : [E, E]       全局专家协方差（对称、半正定）
++    k      : int          每行需要选择的专家个数
++    n_shuffles : int      置换次数
++    random_state : int    随机种子（确定性复现）
++    tie_break : str       出现次数相同的并列时的打破方式：
++                          - "score": 用原 scores 做微小加权
++                          - "random": 用微小随机噪声
++                          - "none": 不做处理（topk按索引稳定决定）
++
++    返回
++    ----
++    final_mask : [T, E] bool   每行恰有 k 个 True 的路由 mask
++    counts     : [T, E] int32  每个专家在各 shuffle 中被选中的次数
++    """
++    assert scores.dim() == 2 and sigma.dim() == 2
++    T, E = scores.shape
++    assert sigma.shape == (E, E)
++    assert 1 <= k <= E, "k 必须在 1..E 之间"
++
++    device = scores.device
++    dtype  = scores.dtype
++
++    # 计数器（跨 shuffle 累计）
++    counts = torch.zeros(T, E, dtype=torch.int32, device=device)
++
++    # 随机源（可复现）
++    g = torch.Generator(device=device)
++    if random_state is not None:
++        g.manual_seed(random_state)
++
++    for _ in range(n_shuffles):
++        # 专家维度置换
++        perm = torch.randperm(E, generator=g, device=device)
++        inv_perm = torch.empty_like(perm)
++        inv_perm[perm] = torch.arange(E, device=device)
++
++        scores_p = scores[:, perm]                               # [T,E]
++        sigma_p  = sigma.index_select(0, perm).index_select(1, perm)  # [E,E]
++
++        # 在置换坐标系下选择
++        mask_p = otep_batched(scores_p, sigma_p, k)              # [T,E] bool
++
++        # 回映射到原坐标
++        mask_back = mask_p[:, inv_perm]                          # [T,E] bool
++
++        # 累计出现次数
++        counts += mask_back.to(counts.dtype)
++
++    # --- 并列打破（可选，小幅度不改变计数主导） ---
++    priority = counts.to(dtype)  # 先把计数转为浮点，便于叠加微小 tie-break
++    if tie_break == "score":
++        # 用原 scores（做标准化后）加一个很小的权重
++        mean = scores.mean(dim=1, keepdim=True)
++        std  = scores.std(dim=1, keepdim=True).clamp_min(1e-12)
++        s_norm = (scores - mean) / std
++        priority = priority + 1e-3 * s_norm
++    elif tie_break == "random":
++        priority = priority + 1e-3 * torch.rand_like(scores, device=scores.device)
++
++    # 取每行 Top-k
++    topk_vals, topk_idx = torch.topk(priority, k, dim=1, largest=True, sorted=False)  # [T,k]
++    final_mask = torch.zeros(T, E, dtype=torch.bool, device=device)
++    final_mask.scatter_(1, topk_idx, True)
++
++    return final_mask
++
+--- a/megatron/core/transformer/transformer_config.py	2026-01-27 21:48:41.075016583 +0800
++++ b/megatron/core/transformer/transformer_config.py	2026-01-19 12:26:46.516958796 +0800
+@@ -287,6 +287,16 @@
+     which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing 
+     algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss"."""
+ 
++    moe_otep_step: int = 5
++    """MOPE steps"""
++
++    moe_otep_warmup_fraction: float = 0.01
++    """Fraction of training to use standard topk routing before switching to OTEP (default 1%)"""
++
++    moe_plot_every: int = 200
++
++    moe_sigma_decay_rate: float = 0.0
++
+     moe_router_topk: int = 2
+     """Number of experts to route to for each token."""
+ 
+@@ -535,7 +545,7 @@
+         if self.moe_expert_capacity_factor is not None:
+             if self.moe_expert_capacity_factor < 0:
+                 self.moe_expert_capacity_factor = None
+-            if self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
++            if self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none", "otep"]:
+                 raise ValueError(
+                     'moe_expert_capacity_factor only works with aux_loss or none load balancing'
+                 )
+--- a/megatron/training/arguments.py	2026-01-27 21:48:41.083016584 +0800
++++ b/megatron/training/arguments.py	2025-12-25 14:24:40.912744163 +0800
+@@ -1310,7 +1310,8 @@
+ 
+ def _add_training_args(parser):
+     group = parser.add_argument_group(title='training')
+-
++    group.add_argument('--last-trainable-layers', type=int, default=None,
++                       help='Number of last trainable layers (freeze earlier layers)')
+     group.add_argument('--micro-batch-size', type=int, default=None,
+                        help='Batch size per model instance (local batch size). '
+                        'Global batch size is local batch size times data '
+@@ -2285,7 +2286,7 @@
+                        help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
+     # Router arguments
+     group.add_argument('--moe-router-load-balancing-type', type=str,
+-                       choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
++                       choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none', 'otep'],
+                        default='aux_loss',
+                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+     group.add_argument('--moe-router-dtype', type=str, 
+@@ -2295,6 +2296,9 @@
+                             'Fp32/fp64 enhances numerical stability, especially with numerous experts. '
+                             'The perf impact should be negligible when used with permute fusion. '
+                             'None means no changes for dtype.')
++    # group.add_argument('--moe-otep-step', type=int, default=5, help='Number of steps for OTEP')
++    group.add_argument('--moe-plot-every', type=int, default=200, help='Number of steps for ploting in OTEP')
++    # group.add_argument('--moe-sigma-decay-rate', type=float, default=0.0, help='decay rate for sigma in mope')
+     group.add_argument('--moe-router-score-function', type=str,
+                        choices=['softmax', 'sigmoid'],
+                        default='softmax',
+@@ -2416,3 +2420,4 @@
+     group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
+                        help='Dtype of exp_avg_sq when enabling precision-aware-optimizer')
+     return parser
++
